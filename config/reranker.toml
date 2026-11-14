@@ -1,0 +1,8 @@
+[reranker]
+host = "127.0.0.1"
+port = 8001
+model = "bge-reranker-v2-m3"
+cache_dir = "data/models/cache"
+device = "xpu"
+default_top_k = 5
+max_candidates = 100
