@@ -55,6 +55,9 @@ use uuid::Uuid;
 struct Cli {
     #[arg(short, long, global = true)]
     config: Option<PathBuf>,
+    /// Print full build metadata (version, commit, build time, target) and exit.
+    #[arg(long)]
+    verbose_version: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -160,6 +163,8 @@ pub struct GatewayProviderConfig {
     pub api_keys: Option<Vec<String>>,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// When set, each chat completion carries the session id under this header name.
+    pub session_header: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -765,9 +770,32 @@ struct SourceRef {
     project_id: Option<String>,
 }
 
+/// Placeholder for build metadata that `avrig-api` cannot report without a `build.rs`.
+const BUILD_METADATA_UNKNOWN: &str = "unknown";
+
+/// One-line build summary printed by `--verbose-version`.
+///
+/// The version comes from `CARGO_PKG_VERSION`; commit, build time, target, and dirtiness
+/// come from `build.rs`. Each field degrades to `unknown` (or `false` for `dirty`) when
+/// the build ran without git metadata.
+fn verbose_version_line() -> String {
+    format!(
+        "avrig {} (commit: {}, built: {}, target: {}, dirty: {})",
+        env!("CARGO_PKG_VERSION"),
+        option_env!("AVRIG_COMMIT_SHORT_SHA").unwrap_or(BUILD_METADATA_UNKNOWN),
+        option_env!("AVRIG_BUILD_TIMESTAMP").unwrap_or(BUILD_METADATA_UNKNOWN),
+        gateway::target_triple(),
+        option_env!("AVRIG_GIT_DIRTY").unwrap_or("false")
+    )
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    if cli.verbose_version {
+        println!("{}", verbose_version_line());
+        return Ok(());
+    }
     let (config, secrets) = load_config(cli.config.as_deref())?;
     let log_settings = &config.logging;
     avrig_logging::init(LoggingConfig {
@@ -1107,7 +1135,12 @@ async fn init_gateway_client(config: &GatewayConfig) -> Result<avrig_gateway::Ll
             }
         }
         client
-            .add_direct_provider(name.clone(), pcfg.base_url.clone(), keys)
+            .add_direct_provider(
+                name.clone(),
+                pcfg.base_url.clone(),
+                keys,
+                pcfg.session_header.clone(),
+            )
             .await;
     }
 
@@ -2483,6 +2516,7 @@ Answer clearly and concisely. For each claim supported by a passage, cite it wit
         max_output_tokens: None,
         tools: None,
         tool_choice: None,
+        session_id: None,
     }
 }
 

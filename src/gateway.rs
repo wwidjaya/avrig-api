@@ -1,11 +1,13 @@
 use avrig_gateway::LlmProviderClient;
 use avrig_gateway::antigravity::converter::ToolHistoryValidationError;
 use avrig_gateway::antigravity::quota::fetch_gemini_cli_quota;
+use avrig_gateway::client::UpstreamStatusError;
+use avrig_gateway::resolver::{ModelResolutionError, resolve_upstream_model_id};
 use avrig_gateway::types::ChatRequest;
 use axum::{
     Json, Router,
     extract::{ConnectInfo, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{
         IntoResponse, Response,
@@ -61,13 +63,40 @@ pub async fn local_only_guard(
     Ok(next.run(req).await)
 }
 
+/// Target triple reported by build metadata.
+///
+/// `build.rs` captures `TARGET` (for example `x86_64-pc-windows-msvc`). The `OS`/`ARCH`
+/// pair remains as a fallback for any build that skipped the build script.
+pub fn target_triple() -> String {
+    match option_env!("AVRIG_TARGET_TRIPLE") {
+        Some(triple) if !triple.is_empty() && triple != "unknown" => triple.to_string(),
+        _ => format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH),
+    }
+}
+
+/// Build metadata exposed by the health endpoint, captured at compile time by `build.rs`.
+///
+/// Commit identity, build timestamp, and dirtiness come from the build script. Each field
+/// degrades to `unknown` (or `false` for `dirty`) when the build ran without git metadata.
+pub fn build_metadata() -> serde_json::Value {
+    json!({
+        "commit_short_sha": option_env!("AVRIG_COMMIT_SHORT_SHA").unwrap_or("unknown"),
+        "build_timestamp": option_env!("AVRIG_BUILD_TIMESTAMP").unwrap_or("unknown"),
+        "target_triple": target_triple(),
+        "dirty": matches!(option_env!("AVRIG_GIT_DIRTY"), Some("true"))
+    })
+}
+
 pub async fn handle_health(State(state): State<Arc<GatewayState>>) -> impl IntoResponse {
     let accounts = state.client.list_accounts().await;
     let active_providers: Vec<String> = accounts.iter().map(|a| a.provider.clone()).collect();
     Json(json!({
         "ok": true,
         "providers": active_providers,
-        "accounts_count": accounts.len()
+        "accounts_count": accounts.len(),
+        "version": env!("CARGO_PKG_VERSION"),
+        "semver": env!("CARGO_PKG_VERSION"),
+        "build": build_metadata()
     }))
 }
 
@@ -148,18 +177,44 @@ pub async fn handle_quota(State(state): State<Arc<GatewayState>>) -> Response {
 
 pub async fn handle_chat_completions(
     State(state): State<Arc<GatewayState>>,
-    Json(input): Json<ChatRequest>,
+    headers: HeaderMap,
+    Json(mut input): Json<ChatRequest>,
 ) -> Response {
-    if input.stream == Some(true) {
+    input.session_id = session_header_value(&headers);
+    let started = std::time::Instant::now();
+    let requested_model = input.model.trim().to_string();
+    let provider = state.client.resolve_provider_name(&requested_model).await;
+    let resolved_model = resolve_upstream_model_id(&requested_model);
+    let stream_requested = input.stream == Some(true);
+
+    if stream_requested {
         match state.client.chat_completion_stream(input).await {
             Ok(stream) => {
+                tracing::info!(
+                    provider = %provider,
+                    requested_model = %requested_model,
+                    upstream_model = %resolved_model,
+                    stream = stream_requested,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "chat completions stream started"
+                );
+                let stream_provider = provider.clone();
+                let stream_model = requested_model.clone();
                 let mapped = stream
-                    .map(|res| match res {
+                    .map(move |res| match res {
                         Ok(chunk) => {
                             let data = serde_json::to_string(&chunk).unwrap_or_default();
                             Ok::<SseEvent, std::convert::Infallible>(SseEvent::default().data(data))
                         }
                         Err(e) => {
+                            tracing::warn!(
+                                provider = %stream_provider,
+                                requested_model = %stream_model,
+                                upstream_status = ?upstream_status(&e),
+                                elapsed_ms = started.elapsed().as_millis() as u64,
+                                error = %e,
+                                "chat completions stream failed"
+                            );
                             let err_json = json!({
                                 "error": {
                                     "message": e.to_string(),
@@ -178,22 +233,101 @@ pub async fn handle_chat_completions(
 
                 Sse::new(mapped).into_response()
             }
-            Err(err) => chat_completion_error_response(err),
+            Err(err) => {
+                let (status, error_type) = chat_completion_error_status(&err);
+                tracing::warn!(
+                    provider = %provider,
+                    requested_model = %requested_model,
+                    upstream_model = %resolved_model,
+                    upstream_status = ?upstream_status(&err),
+                    http_status = status.as_u16(),
+                    error_type = error_type,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    error = %err,
+                    "chat completions request rejected"
+                );
+                chat_completion_error_response(err)
+            }
         }
     } else {
         match state.client.chat_completion(input).await {
-            Ok(resp) => Json(resp).into_response(),
-            Err(err) => chat_completion_error_response(err),
+            Ok(resp) => {
+                tracing::info!(
+                    provider = %provider,
+                    requested_model = %requested_model,
+                    upstream_model = %resolved_model,
+                    response_model = %resp.model,
+                    stream = stream_requested,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "chat completions request completed"
+                );
+                Json(resp).into_response()
+            }
+            Err(err) => {
+                let (status, error_type) = chat_completion_error_status(&err);
+                tracing::warn!(
+                    provider = %provider,
+                    requested_model = %requested_model,
+                    upstream_model = %resolved_model,
+                    upstream_status = ?upstream_status(&err),
+                    http_status = status.as_u16(),
+                    error_type = error_type,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    error = %err,
+                    "chat completions request failed"
+                );
+                chat_completion_error_response(err)
+            }
         }
     }
 }
 
-fn chat_completion_error_response(err: anyhow::Error) -> Response {
-    let (status, error_type) = if err.downcast_ref::<ToolHistoryValidationError>().is_some() {
+/// Upstream status carried by the error, when the provider reported one.
+fn upstream_status(err: &anyhow::Error) -> Option<u16> {
+    err.downcast_ref::<UpstreamStatusError>().map(|e| e.status)
+}
+
+/// Session id supplied by the calling client, if any.
+///
+/// OpenCode sends `x-opencode-session` on every model request and OpenCode Go requires it.
+/// `x-opencode-session-id` and `X-Session-Id` are accepted as fallbacks for other clients.
+fn session_header_value(headers: &HeaderMap) -> Option<String> {
+    [
+        "x-opencode-session",
+        "x-opencode-session-id",
+        "X-Session-Id",
+    ]
+    .iter()
+    .find_map(|name| {
+        headers
+            .get(*name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned)
+    })
+}
+
+/// Map a dispatch failure to its HTTP status and error envelope type.
+fn chat_completion_error_status(err: &anyhow::Error) -> (StatusCode, &'static str) {
+    if err.downcast_ref::<ToolHistoryValidationError>().is_some() {
         (StatusCode::BAD_REQUEST, "invalid_request_error")
+    } else if err.downcast_ref::<ModelResolutionError>().is_some() {
+        (StatusCode::NOT_FOUND, "model_not_found")
+    } else if err
+        .downcast_ref::<UpstreamStatusError>()
+        .is_some_and(UpstreamStatusError::reports_unknown_model)
+    {
+        // Upstream 400/404 that names the model as unknown: the caller's model is wrong, so
+        // report it like a local resolution failure instead of an upstream outage.
+        (StatusCode::NOT_FOUND, "model_not_found")
     } else {
         (StatusCode::BAD_GATEWAY, "upstream_error")
-    };
+    }
+}
+
+fn chat_completion_error_response(err: anyhow::Error) -> Response {
+    let (status, error_type) = chat_completion_error_status(&err);
     (
         status,
         Json(json!({
@@ -255,6 +389,75 @@ mod tests {
     }
 
     #[test]
+    fn unknown_model_prefix_maps_to_not_found() {
+        let response =
+            chat_completion_error_response(ModelResolutionError::ModelNotFound {
+                prefix: "composync".into(),
+                model: "composync/paid".into(),
+            }
+            .into());
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn unknown_model_prefix_body_reports_model_not_found() {
+        let response =
+            chat_completion_error_response(ModelResolutionError::ModelNotFound {
+                prefix: "composync".into(),
+                model: "composync/paid".into(),
+            }
+            .into());
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("read body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(value["error"]["type"], serde_json::json!("model_not_found"));
+        assert_eq!(
+            value["error"]["message"],
+            serde_json::json!("Unknown model prefix 'composync' for model 'composync/paid'")
+        );
+    }
+
+    #[test]
+    fn unlisted_sub_model_maps_to_not_found() {
+        let response =
+            chat_completion_error_response(ModelResolutionError::SubModelNotFound {
+                provider: "composync".into(),
+                model: "composync/does-not-exist-model".into(),
+            }
+            .into());
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn upstream_unknown_model_fault_maps_to_not_found() {
+        // The live composync 400 for a nonexistent sub-model must be reported as model_not_found.
+        let err = UpstreamStatusError {
+            status: 400,
+            body: r#"{"error":{"message":"Unable to determine provider for model 'does-not-exist-model'.","type":"invalid_request_error","code":"bad_request"}}"#.to_string(),
+        };
+        let (status, error_type) = chat_completion_error_status(&err.into());
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(error_type, "model_not_found");
+    }
+
+    #[test]
+    fn generic_upstream_bad_requests_stay_bad_gateway() {
+        for body in [
+            r#"{"error":{"message":"messages: at least one message is required"}}"#,
+            r#"{"error":{"message":"This model's maximum context length is 8192 tokens, however you requested 9000 tokens."}}"#,
+        ] {
+            let err = UpstreamStatusError {
+                status: 400,
+                body: body.to_string(),
+            };
+            let (status, error_type) = chat_completion_error_status(&err.into());
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "body: {body}");
+            assert_eq!(error_type, "upstream_error", "body: {body}");
+        }
+    }
+
+    #[test]
     fn claude_path_rejection_maps_to_bad_request_before_dispatch() {
         // The variant table above proves the mapping. This test proves the Claude replay path
         // itself produces a validation error for a real history shape: the paired history
@@ -291,6 +494,61 @@ mod tests {
 
         let response = chat_completion_error_response(err.into());
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn health_reports_version_and_build_metadata() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let state = GatewayState {
+            client: Arc::new(LlmProviderClient::new()),
+            local_only: false,
+            pending_oauth: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        };
+        let router = build_gateway_router(state);
+
+        for path in ["/health", "/api/v1/health", "/v1/health"] {
+            let req = Request::builder()
+                .uri(path)
+                .method("GET")
+                .body(Body::empty())
+                .expect("build health request");
+            let response = router.clone().oneshot(req).await.expect("health response");
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("read health body");
+            let value: serde_json::Value =
+                serde_json::from_slice(&body).expect("health body is json");
+            println!("{path} -> {value}");
+
+            assert_eq!(value["ok"], serde_json::json!(true));
+            assert!(value["providers"].is_array());
+            assert!(value["accounts_count"].is_number());
+            assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
+            assert_eq!(value["semver"], env!("CARGO_PKG_VERSION"));
+
+            let build = &value["build"];
+            assert_eq!(build["target_triple"], target_triple());
+            assert!(build["dirty"].is_boolean());
+
+            let commit = build["commit_short_sha"]
+                .as_str()
+                .expect("commit_short_sha is a string");
+            if commit != "unknown" {
+                assert_eq!(commit.len(), 7, "short sha must be 7 characters");
+            }
+
+            let timestamp = build["build_timestamp"]
+                .as_str()
+                .expect("build_timestamp is a string");
+            if timestamp != "unknown" {
+                assert_eq!(timestamp.len(), 20, "ISO-8601 UTC timestamp is 20 chars");
+                assert!(timestamp.ends_with('Z'), "timestamp must be UTC");
+            }
+        }
     }
 }
 
@@ -395,5 +653,58 @@ pub async fn handle_antigravity_callback(
             format!("Failed to exchange authorization code: {}", err),
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod session_header_tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    /// Build a header map from literal pairs; header names are case-insensitive.
+    fn headers(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(*name, HeaderValue::from_str(value).expect("header value"));
+        }
+        map
+    }
+
+    #[test]
+    fn canonical_session_header_wins_when_all_are_present() {
+        let map = headers(&[
+            ("x-opencode-session", "canonical"),
+            ("x-opencode-session-id", "session-id"),
+            ("X-Session-Id", "session-affinity"),
+        ]);
+        assert_eq!(session_header_value(&map).as_deref(), Some("canonical"));
+    }
+
+    #[test]
+    fn opencode_session_id_is_used_alone() {
+        let map = headers(&[("x-opencode-session-id", "abc-123")]);
+        assert_eq!(session_header_value(&map).as_deref(), Some("abc-123"));
+    }
+
+    #[test]
+    fn session_affinity_header_is_used_alone() {
+        let map = headers(&[("X-Session-Id", "affinity-9")]);
+        assert_eq!(session_header_value(&map).as_deref(), Some("affinity-9"));
+    }
+
+    #[test]
+    fn blank_candidate_is_skipped_for_the_next_one() {
+        let map = headers(&[
+            ("x-opencode-session", "   "),
+            ("x-opencode-session-id", "  next-value  "),
+        ]);
+        assert_eq!(session_header_value(&map).as_deref(), Some("next-value"));
+    }
+
+    #[test]
+    fn no_session_header_yields_none() {
+        let map = headers(&[("authorization", "Bearer token")]);
+        assert_eq!(session_header_value(&map), None);
+        assert_eq!(session_header_value(&HeaderMap::new()), None);
     }
 }
