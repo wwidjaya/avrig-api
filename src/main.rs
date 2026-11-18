@@ -165,6 +165,9 @@ pub struct GatewayProviderConfig {
     pub enabled: bool,
     /// When set, each chat completion carries the session id under this header name.
     pub session_header: Option<String>,
+    /// Outbound User-Agent policy: `{forward}` passes the caller's application agent through,
+    /// any other value is sent verbatim, and an absent value keeps the gateway default.
+    pub user_agent: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -1140,6 +1143,7 @@ async fn init_gateway_client(config: &GatewayConfig) -> Result<avrig_gateway::Ll
                 pcfg.base_url.clone(),
                 keys,
                 pcfg.session_header.clone(),
+                provider_user_agent(pcfg),
             )
             .await;
     }
@@ -1155,6 +1159,17 @@ fn resolve_env_var(raw: &str) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+/// User-Agent policy for a direct provider, after environment expansion.
+///
+/// `resolve_env_var` only expands a `{env:VAR}` prefix, so the `{forward}` sentinel used by
+/// the gateway passes through untouched and stays available in configuration.
+fn provider_user_agent(pcfg: &GatewayProviderConfig) -> Option<String> {
+    pcfg.user_agent
+        .as_deref()
+        .map(resolve_env_var)
+        .filter(|value| !value.trim().is_empty())
 }
 
 async fn run_gateway(config: GatewayConfig, cancellation: CancellationToken) -> Result<()> {
@@ -2517,6 +2532,7 @@ Answer clearly and concisely. For each claim supported by a passage, cite it wit
         tools: None,
         tool_choice: None,
         session_id: None,
+        user_agent: None,
     }
 }
 

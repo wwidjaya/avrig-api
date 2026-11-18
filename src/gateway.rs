@@ -181,6 +181,7 @@ pub async fn handle_chat_completions(
     Json(mut input): Json<ChatRequest>,
 ) -> Response {
     input.session_id = session_header_value(&headers);
+    input.user_agent = header_value(&headers, "user-agent");
     let started = std::time::Instant::now();
     let requested_model = input.model.trim().to_string();
     let provider = state.client.resolve_provider_name(&requested_model).await;
@@ -287,6 +288,16 @@ fn upstream_status(err: &anyhow::Error) -> Option<u16> {
     err.downcast_ref::<UpstreamStatusError>().map(|e| e.status)
 }
 
+/// Non-empty, trimmed value of one inbound header.
+fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned)
+}
+
 /// Session id supplied by the calling client, if any.
 ///
 /// OpenCode sends `x-opencode-session` on every model request and OpenCode Go requires it.
@@ -298,14 +309,7 @@ fn session_header_value(headers: &HeaderMap) -> Option<String> {
         "X-Session-Id",
     ]
     .iter()
-    .find_map(|name| {
-        headers
-            .get(*name)
-            .and_then(|v| v.to_str().ok())
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .map(str::to_owned)
-    })
+    .find_map(|name| header_value(headers, name))
 }
 
 /// Map a dispatch failure to its HTTP status and error envelope type.

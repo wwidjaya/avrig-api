@@ -40,6 +40,7 @@ async fn test_llm_provider_client_registry() {
             "http://127.0.0.1:12345".to_string(),
             vec!["key1".to_string(), "key2".to_string()],
             None,
+            None,
         )
         .await;
 
@@ -111,6 +112,7 @@ async fn test_gateway_route_handlers() {
         tools: None,
         tool_choice: None,
         session_id: None,
+        user_agent: None,
     };
     let req = Request::builder()
         .uri("/v1/chat/completions")
@@ -156,6 +158,7 @@ async fn test_unknown_model_prefix_is_rejected_before_dispatch() {
         tools: None,
         tool_choice: None,
         session_id: None,
+        user_agent: None,
     };
     let req = Request::builder()
         .uri("/v1/chat/completions")
@@ -220,6 +223,7 @@ async fn stub_provider_router(base_url: String) -> axum::Router {
             "composync".to_string(),
             base_url,
             vec!["test-key".to_string()],
+            None,
             None,
         )
         .await;
