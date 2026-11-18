@@ -1,0 +1,3 @@
+INCIDENT REPORT: Database replica failover incident.
+The primary PostgreSQL cluster at postgresql.avrig.ai experienced transient connection timeouts.
+The standby node was promoted automatically within 45 seconds using patroni leader election consensus.

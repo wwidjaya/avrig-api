@@ -1,0 +1,12 @@
+{
+  "topology": "hybrid-cloud",
+  "pki": {
+    "root_ca": "avrig-root-ca",
+    "vault_mount": "pki_avrig_ai",
+    "default_lease_ttl_hours": 720
+  },
+  "storage": {
+    "engine": "garage-s3",
+    "bucket": "avrig-documents"
+  }
+}

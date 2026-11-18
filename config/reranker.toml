@@ -1,8 +1,17 @@
 [reranker]
-host = "127.0.0.1"
-port = 8001
+host = "0.0.0.0"
+port = 8000
+# Address the API gateway uses for the reranker service. The client appends
+# /reranker, yielding https://api.avrig.ai/reranker. Remove this key to run
+# search without reranking; failures fall back to vector order at request time.
+base_url = "https://api.avrig.ai"
+request_timeout_ms = 60000
+# Optional PEM bundle of extra root CAs for verifying the service certificate.
+# When absent, the platform trust store is used, which already contains the
+# avrig-ai root CA inside the avrig-ai WSL distribution.
+# ca_cert_path = "config/avrig-root-ca.crt"
 model = "bge-reranker-v2-m3"
 cache_dir = "data/models/cache"
-device = "xpu"
+device = "cpu"
 default_top_k = 5
 max_candidates = 100

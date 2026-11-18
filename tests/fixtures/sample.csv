@@ -1,0 +1,5 @@
+service_name,p95_latency_ms,error_rate,concurrency_limit
+auth_service,12.4,0.001,500
+api_gateway,8.2,0.0005,1000
+vector_search,45.8,0.002,250
+storage_service,28.1,0.0008,400

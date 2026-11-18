@@ -1,0 +1,30 @@
+/target/
+/data/
+/.run/
+/logs/
+
+# Local configuration that may contain credentials
+config/antigravity-accounts.json
+config/antigravity.json
+config/chatgpt.json
+config/gateway.toml
+config/config.toml
+config/database.toml
+config/embedding.toml
+config/oidc.toml
+config/opencode.toml
+config/server.toml
+config/watcher.toml
+
+# Secrets and local environment
+.secrets/
+.env
+.env.*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+
+# Nested build outputs
+tools/**/target/
+
