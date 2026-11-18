@@ -28,3 +28,8 @@ Thumbs.db
 # Nested build outputs
 tools/**/target/
 
+
+# Local config backups
+config/*.bak*
+*.bak
+
