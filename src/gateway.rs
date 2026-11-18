@@ -295,10 +295,10 @@ mod tests {
 }
 
 pub async fn handle_antigravity_login(State(state): State<Arc<GatewayState>>) -> impl IntoResponse {
-    let client_id = avrig_gateway::antigravity::types::DEFAULT_CLIENT_ID;
+    let client_id = avrig_gateway::antigravity::types::default_client_id();
     let redirect_uri = "http://127.0.0.1:8000/oauth-callback";
 
-    match avrig_gateway::antigravity::oauth::generate_pkce_and_auth_url(client_id, redirect_uri) {
+    match avrig_gateway::antigravity::oauth::generate_pkce_and_auth_url(&client_id, redirect_uri) {
         Ok((auth_url, verifier, oauth_state)) => {
             state
                 .pending_oauth
@@ -351,22 +351,22 @@ pub async fn handle_antigravity_callback(
         return (StatusCode::BAD_REQUEST, "Unknown or expired OAuth state").into_response();
     };
 
-    let client_id = avrig_gateway::antigravity::types::DEFAULT_CLIENT_ID;
-    let client_secret = avrig_gateway::antigravity::types::DEFAULT_CLIENT_SECRET;
+    let client_id = avrig_gateway::antigravity::types::default_client_id();
+    let client_secret = avrig_gateway::antigravity::types::default_client_secret();
     let target_path = std::path::PathBuf::from("config/antigravity.json");
 
     match avrig_gateway::antigravity::oauth::exchange_code(
         &target_path,
-        client_id,
-        client_secret,
+        &client_id,
+        &client_secret,
         &code,
         &verifier,
     ) {
         Ok(creds) => {
             let ag_state = avrig_gateway::antigravity::state::AppState::new(
                 target_path,
-                client_id.to_string(),
-                client_secret.to_string(),
+                client_id.clone(),
+                client_secret.clone(),
                 creds.clone(),
             );
             let alias = creds.email.clone().unwrap_or_else(|| "primary".to_string());

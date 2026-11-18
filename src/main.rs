@@ -944,13 +944,16 @@ async fn init_gateway_client(config: &GatewayConfig) -> Result<avrig_gateway::Ll
     let client = avrig_gateway::LlmProviderClient::new();
 
     if config.antigravity.enabled {
-        let client_id =
-            config.antigravity.client_id.clone().unwrap_or_else(|| {
-                avrig_gateway::antigravity::types::DEFAULT_CLIENT_ID.to_string()
-            });
-        let client_secret = config.antigravity.client_secret.clone().unwrap_or_else(|| {
-            avrig_gateway::antigravity::types::DEFAULT_CLIENT_SECRET.to_string()
-        });
+        let client_id = config
+            .antigravity
+            .client_id
+            .clone()
+            .unwrap_or_else(avrig_gateway::antigravity::types::default_client_id);
+        let client_secret = config
+            .antigravity
+            .client_secret
+            .clone()
+            .unwrap_or_else(avrig_gateway::antigravity::types::default_client_secret);
 
         // 1. Inlined configured accounts
         for acc in &config.antigravity.accounts {
@@ -1210,19 +1213,19 @@ async fn handle_cli_login(
             let client_id = config
                 .antigravity
                 .client_id
-                .as_deref()
-                .unwrap_or(avrig_gateway::antigravity::types::DEFAULT_CLIENT_ID);
+                .clone()
+                .unwrap_or_else(avrig_gateway::antigravity::types::default_client_id);
             let client_secret = config
                 .antigravity
                 .client_secret
-                .as_deref()
-                .unwrap_or(avrig_gateway::antigravity::types::DEFAULT_CLIENT_SECRET);
+                .clone()
+                .unwrap_or_else(avrig_gateway::antigravity::types::default_client_secret);
             println!(
                 "Logging in to Antigravity (Google OAuth) for account '{}'...",
                 alias
             );
             let creds =
-                avrig_gateway::antigravity::oauth::login(&target_path, client_id, client_secret)?;
+                avrig_gateway::antigravity::oauth::login(&target_path, &client_id, &client_secret)?;
             println!(
                 "Successfully authorized Antigravity account '{}': {:?}",
                 alias, creds.email
