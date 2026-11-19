@@ -9,8 +9,9 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $destinationDir = 'D:\avrig'
 
-# The answer model every node must carry. Patched into each node's own
+# The answer model the Linux node must carry. Patched into that node's own
 # server.toml; the repository template is never copied, because it binds 0.0.0.0.
+# The Windows node has no server role, so it carries no server.toml at all.
 $serverAnswerModel = 'opencode/big-pickle'
 
 function Get-Sha256([string]$Path) {
@@ -32,94 +33,6 @@ function Get-ServerTomlValue([string]$Content, [string]$Key) {
         return $null
     }
     return $match.Groups['value'].Value.Trim().Trim('"')
-}
-
-<#
-.SYNOPSIS
-Returns server config text with only the answer_model line changed.
-
-.DESCRIPTION
-Every other line, including the host binding, is carried through untouched. The
-function refuses to return text whose host binding differs from the input, so a
-loopback deployment can never silently turn into a public listener.
-#>
-function Update-ServerTomlText {
-    param(
-        [Parameter(Mandatory)][string]$Content,
-        [Parameter(Mandatory)][string]$Model,
-        [Parameter(Mandatory)][string]$Description
-    )
-
-    $hostBefore = Get-ServerTomlValue -Content $Content -Key 'host'
-    if (-not $hostBefore) {
-        throw "The $Description server config has no host setting. Refusing to patch it."
-    }
-
-    $replacement = 'answer_model = "' + $Model + '"'
-    # Capture the leading indent and the line ending separately, so a CRLF file
-    # stays CRLF instead of quietly gaining mixed endings.
-    $pattern = '(?m)^(?<lead>[ \t]*)answer_model[ \t]*=[ \t]*[^\r\n]*(?<eol>\r?)$'
-
-    if ([regex]::IsMatch($Content, $pattern)) {
-        $evaluator = [System.Text.RegularExpressions.MatchEvaluator] {
-            param($match)
-            return $match.Groups['lead'].Value + $replacement + $match.Groups['eol'].Value
-        }
-        $updated = [regex]::Replace($Content, $pattern, $evaluator)
-    } else {
-        # Add the key to the existing [server] section; do not invent a section.
-        $header = [regex]::Match($Content, '(?m)^(?<lead>[ \t]*)\[server\][ \t]*\r?\n')
-        if (-not $header.Success) {
-            throw "The $Description server config has no [server] section. Refusing to patch it."
-        }
-        $newline = if ($Content.Contains("`r`n")) { "`r`n" } else { "`n" }
-        $updated = $Content.Insert($header.Index + $header.Length, $replacement + $newline)
-    }
-
-    $hostAfter = Get-ServerTomlValue -Content $updated -Key 'host'
-    if ($hostAfter -cne $hostBefore) {
-        throw "Refusing to write the $Description server config: the host binding would change from '$hostBefore' to '$hostAfter'."
-    }
-    if ((Get-ServerTomlValue -Content $updated -Key 'answer_model') -cne $Model) {
-        throw "Failed to set answer_model in the $Description server config."
-    }
-
-    return $updated
-}
-
-<#
-.SYNOPSIS
-Patches answer_model in a local server.toml, preserving everything else.
-
-.DESCRIPTION
-Fails loudly when the file is missing rather than creating one blind. Keeps the
-file's encoding and records the previous content beside it before writing.
-#>
-function Set-ServerTomlAnswerModel {
-    param(
-        [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][string]$Model,
-        [Parameter(Mandatory)][string]$Description
-    )
-
-    if (-not (Test-Path -LiteralPath $Path)) {
-        throw "$Description server config not found: $Path. Create it deliberately; the deploy script will not invent one."
-    }
-
-    $bytes = [System.IO.File]::ReadAllBytes($Path)
-    $hasBom = ($bytes.Length -ge 3) -and ($bytes[0] -eq 0xEF) -and ($bytes[1] -eq 0xBB) -and ($bytes[2] -eq 0xBF)
-    $content = [System.IO.File]::ReadAllText($Path)
-    $updated = Update-ServerTomlText -Content $content -Model $Model -Description $Description
-
-    if ($updated -ceq $content) {
-        Write-Host "$Description server config already carries answer_model = `"$Model`" ($Path)" -ForegroundColor DarkCyan
-        return
-    }
-
-    $backup = "$Path.bak-$([DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ'))-deploy"
-    Copy-Item -LiteralPath $Path -Destination $backup -Force
-    [System.IO.File]::WriteAllText($Path, $updated, (New-Object System.Text.UTF8Encoding($hasBom)))
-    Write-Host "$Description server config answer_model set to `"$Model`" ($Path, previous file at $backup)" -ForegroundColor Cyan
 }
 
 <#
@@ -498,12 +411,15 @@ if ($Target -in @('all', 'windows')) {
 # read back from disk rather than from memory, so the printed values are real.
 Write-Host "`nEffective server configuration:" -ForegroundColor Cyan
 if ($Target -in @('all', 'windows')) {
+    # The Windows node runs roles = ["watcher","reranker","gateway"] with no server
+    # role, so it never reads a server.toml. Its absence is expected and healthy:
+    # reporting it as a warning would only train operators to ignore warnings.
     $reportPath = Join-Path (Join-Path $destinationDir 'config') 'server.toml'
     if (Test-Path -LiteralPath $reportPath) {
         Show-ServerConfig -Description 'Windows' -Content ([System.IO.File]::ReadAllText($reportPath))
         Write-Output "  file: $reportPath"
     } else {
-        Write-Warning "Windows server config is missing: $reportPath"
+        Write-Output "  Windows: no server.toml at $reportPath, and none is expected (node has no server role)"
     }
 }
 if ($Target -in @('all', 'linux')) {
@@ -514,7 +430,12 @@ else
   echo DEPLOY_MISSING
 fi
 '@
-    $linuxContent = ($linuxReportScript | & wsl.exe -d 'avrig-ai' -u root -- bash -s) -join "`n"
+    # PowerShell writes a piped string to a native process with CRLF endings, and
+    # bash chokes on the trailing CR ("syntax error: unexpected end of file").
+    # Normalize to LF and pass the script as one bash -c argument, which keeps the
+    # embedded newlines intact.
+    $linuxReportScript = ($linuxReportScript -split "`r?`n") -join "`n"
+    $linuxContent = (wsl.exe -d 'avrig-ai' -u root -- bash -c $linuxReportScript) -join "`n"
     $reportExit = $LASTEXITCODE
     if ($reportExit -ne 0 -or $linuxContent -match 'DEPLOY_MISSING' -or [string]::IsNullOrWhiteSpace($linuxContent)) {
         Write-Warning 'Linux server config is missing or unreadable: /opt/avrig/config/server.toml'
