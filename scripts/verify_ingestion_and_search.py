@@ -4,12 +4,20 @@ ctx = ssl.create_default_context()
 ctx.check_hostname = False
 ctx.verify_mode = ssl.CERT_NONE
 
+# CLIENT_SECRET is the OAuth client secret for the service client. It is
+# deliberately absent from this file. Export it before running the script,
+# sourcing the value from a local untracked environment file (for example
+# .secrets/ingest.env) or a secret manager.
+CLIENT_SECRET = os.environ.get("CLIENT_SECRET")
+if not CLIENT_SECRET:
+    raise SystemExit("CLIENT_SECRET must be set in the environment")
+
 # 1. Acquire Token
 token_url = "https://iam.avrig.ai/auth/v1/oidc/token"
 data = urllib.parse.urlencode({
     "grant_type": "client_credentials",
     "client_id": "avrig-watcher",
-    "client_secret": "aIVdKmmeElQrQXQFuywUUpUHhILdvRIlswiwCheHzKepGKuJvGaEFcnzlaxmSIYg",
+    "client_secret": CLIENT_SECRET,
     "scope": "openid documents:read documents:write"
 }).encode('utf-8')
 

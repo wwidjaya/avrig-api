@@ -40,6 +40,16 @@ It deploys and registers the executable as an automatic Windows Service (`avrig-
 using NSSM, restarting the service cleanly after copying. It also deploys the Linux
 executable to `/opt/avrig/avrig` inside the `avrig-ai` WSL instance.
 
+Both targets carry their answer model through `<exec dir>/config/server.toml`, and
+the deploy keeps that file per node rather than copying the repository template,
+which binds `0.0.0.0`. On Linux it rewrites only the `answer_model` line of
+`/opt/avrig/config/server.toml` and leaves the loopback host, port, upload
+directory, and search threshold untouched; a missing file fails the deploy instead
+of being created blind. On Windows it creates `D:\avrig\config\server.toml` once
+with an explicit `host = "127.0.0.1"`, then patches only `answer_model` on later
+runs. The previous file is saved beside it before any change, and the deploy ends
+by printing the effective `host` and `answer_model` for each target.
+
 Application logs use the shared `avrig-logging` crate and are written as
 newline-delimited JSON to `logs/avrig.log` relative to the process working
 directory. Records include UTC RFC 3339 timestamps, level, tracing target,
@@ -51,10 +61,12 @@ size limit in MiB, and archive count.
 `run` uses the roles in `config/config.toml`. The initial default role is the
 HTTP server. The API exposes `/api/v1/health`,
 `HEAD|GET /api/v1/documents/by-hash/{sha256}`, `POST /api/v1/documents/upload`,
-`POST /api/v1/documents/search`, and source-reference reads. Document routes
-require an `Authorization: Bearer <access-token>` header. They validate the JWT
-signature against Rauthy's discovered JWKS, and check issuer, audience, expiry,
-and the configured scope (`documents:read` for search and hash lookup).
+`GET|POST /api/v1/knowledge/search`, and source-reference reads. Search and the
+other document routes require an `Authorization: Bearer <access-token>` header.
+They validate the JWT signature against Rauthy's discovered JWKS, and check
+issuer, audience, and expiry. A service token must also carry every scope listed
+in `oidc.required_scopes` (`documents:read` by default); an interactive token
+carrying the `openid` scope is accepted without that check.
 
 ## OpenCode Big Pickle
 
@@ -78,20 +90,43 @@ clients.
 }
 ```
 
-## Document search
+## Knowledge search
 
-`POST /api/v1/documents/search` is retrieval only: it embeds the query, pulls a
-candidate set from `km.document_vector`, reranks the passages, and returns them
-with provenance. It does not classify intent, generate an answer, or invoke an
-agent.
+`GET /api/v1/knowledge/search` and `POST /api/v1/knowledge/search` are the single
+search endpoint. Both run the same pipeline: they embed the query, pull a
+candidate set from `km.document_vector`, rerank the passages, and return them
+with provenance. The only difference between the two methods is how the request
+parameters arrive. Neither method classifies intent.
+
+`POST` takes a JSON body. `GET` takes the same fields as query parameters, with
+`q` or `query` for the question:
 
 ```json
 {"query": "schema migration", "limit": 5, "threshold": -2.0}
 ```
 
+```text
+GET /api/v1/knowledge/search?q=schema+migration&limit=5
+```
+
 `limit` defaults to `5` and must be between `1` and `50`. `query` is trimmed and
 must be 1 to 4096 characters. `threshold` is optional and accepts any finite
 `f32`.
+
+### Choosing a transport
+
+Both methods accept a `stream` option: a boolean body field on `POST`, the query
+parameter `stream` on `GET`. The value resolves in this order:
+
+| `stream` | Response |
+| :--- | :--- |
+| `true` | `text/event-stream` |
+| `false` | JSON, even when the client sends an event-stream `Accept` header |
+| absent | negotiate on `Accept`; SSE when it contains `text/event-stream`, JSON otherwise |
+
+An explicit `stream` always wins over the `Accept` header.
+
+Without streaming, the response carries the retrieved passages only:
 
 ```json
 {
@@ -131,6 +166,49 @@ reranker logits are different scales. When the reranker is not configured, times
 out, or fails, the response keeps vector order, sets `reranked` to `false` and
 `rerank_score` to `null`, logs a warning without query text, and ignores
 `threshold`.
+
+With streaming, the response is a sequence of server-sent events:
+`metadata` (query, count, reranked), then one or more `answer_delta` events
+carrying the synthesized answer, then `citations` holding the same passages in a
+`results` field, then `done`. When no answer can be generated the stream still
+completes: it emits `metadata`, a single fallback `answer_delta`, `citations`,
+and `done`. A failure in the middle of generation emits an `error` event before
+the stream continues to `citations`.
+
+### Answer model
+
+Streaming answers are generated from the retrieved passages by the model named in
+`server.answer_model`, which defaults to `opencode/big-pickle`. The value is a
+`provider/model` string, so `opencode` selects the gateway's `opencode` provider
+and `big-pickle` is forwarded upstream unchanged. That provider authenticates
+with `OPENCODE_API_KEY`, which is separate from the `OPENCODE_CONSOLE_API_KEY`
+used by the console client described above. When the key is missing or the
+provider is not configured, search itself still succeeds and the answer falls
+back as described.
+
+Validation errors, including a blank query, a query over 4096 characters, a
+`limit` outside `1..=50`, and a non-finite `threshold`, return `400`. A missing
+or invalid bearer token returns `401` when OIDC is configured.
+
+### Removed search paths
+
+The earlier search routes are gone and answer `410 Gone` with a JSON `error`
+field naming the new endpoint. They are kept as tombstones so an old client gets
+an explicit answer instead of the console's `index.html` fallback:
+
+```text
+/api/v1/documents/search
+/api/v1/documents/search/stream
+/v1/documents/search
+/v1/documents/search/stream
+/v1/search
+```
+
+Document management is unchanged: `POST /api/v1/documents/upload`,
+`HEAD|GET /api/v1/documents/by-hash/{sha256}`, and
+`GET /api/v1/documents/{id}/sources`.
+
+### Reranker settings
 
 Reranker settings live in `config/reranker.toml` under `[reranker]`. `base_url`
 is required for reranking and the client appends `/reranker`. `request_timeout_ms`

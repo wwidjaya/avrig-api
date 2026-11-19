@@ -112,7 +112,8 @@ pub async fn handle_version() -> impl IntoResponse {
         "version": raw_semver,
         "major": major,
         "minor": minor,
-        "patch": patch
+        "patch": patch,
+        "build": build_metadata()
     }))
 }
 
@@ -195,6 +196,7 @@ pub async fn handle_chat_completions(
                     provider = %provider,
                     requested_model = %requested_model,
                     upstream_model = %resolved_model,
+                    upstream_status = ?Some(200_u16),
                     stream = stream_requested,
                     elapsed_ms = started.elapsed().as_millis() as u64,
                     "chat completions stream started"
@@ -552,6 +554,77 @@ mod tests {
                 assert_eq!(timestamp.len(), 20, "ISO-8601 UTC timestamp is 20 chars");
                 assert!(timestamp.ends_with('Z'), "timestamp must be UTC");
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn version_reports_its_own_build_object_matching_health() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let state = GatewayState {
+            client: Arc::new(LlmProviderClient::new()),
+            local_only: false,
+            pending_oauth: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        };
+        let router = build_gateway_router(state);
+
+        let mut health_build: Option<serde_json::Value> = None;
+        for path in ["/health", "/api/v1/health", "/v1/health"] {
+            let req = Request::builder()
+                .uri(path)
+                .method("GET")
+                .body(Body::empty())
+                .expect("build health request");
+            let response = router.clone().oneshot(req).await.expect("health response");
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("read health body");
+            let value: serde_json::Value =
+                serde_json::from_slice(&body).expect("health body is json");
+            health_build = Some(value["build"].clone());
+        }
+
+        for path in ["/version", "/api/v1/version", "/v1/version"] {
+            let req = Request::builder()
+                .uri(path)
+                .method("GET")
+                .body(Body::empty())
+                .expect("build version request");
+            let response = router.clone().oneshot(req).await.expect("version response");
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("read version body");
+            let value: serde_json::Value =
+                serde_json::from_slice(&body).expect("version body is json");
+            println!("{path} -> {value}");
+
+            assert_eq!(value["semver"], env!("CARGO_PKG_VERSION"));
+            assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
+            assert!(value["major"].is_number());
+            assert!(value["minor"].is_number());
+            assert!(value["patch"].is_number());
+
+            // V4 and V5 both read the build object, so the two endpoints must not disagree.
+            let build = &value["build"];
+            assert_eq!(
+                build,
+                &health_build.clone().expect("health build captured"),
+                "{path} must report the same build object as /api/v1/health"
+            );
+            assert_eq!(build["target_triple"], target_triple());
+            assert!(build["dirty"].is_boolean());
+            assert!(
+                build["commit_short_sha"].is_string(),
+                "commit_short_sha is a string"
+            );
+            assert!(
+                build["build_timestamp"].is_string(),
+                "build_timestamp is a string"
+            );
         }
     }
 }

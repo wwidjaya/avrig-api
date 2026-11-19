@@ -18,7 +18,7 @@ use axum::{
         IntoResponse, Response,
         sse::{Event as SseEvent, Sse},
     },
-    routing::{get, head, post},
+    routing::{any, get, head, post},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use clap::{Parser, Subcommand};
@@ -290,7 +290,7 @@ fn default_upload_dir() -> PathBuf {
     PathBuf::from("data/uploads")
 }
 fn default_answer_model() -> String {
-    "agy/gemini-3.8-flash-low".into()
+    "opencode/big-pickle".into()
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -1510,22 +1510,17 @@ async fn run_server(
     }
     app = app
         .route(
-            "/v1/documents/search",
-            get(search_documents_get).post(search_documents),
+            "/api/v1/knowledge/search",
+            get(knowledge_search_get).post(knowledge_search),
         )
-        .route("/v1/documents/search/stream", post(search_documents_stream))
-        .route(
-            "/v1/search",
-            get(search_documents_get).post(search_documents),
-        )
-        .route(
-            "/api/v1/documents/search",
-            get(search_documents_get).post(search_documents),
-        )
+        .route("/api/v1/documents/search", any(search_endpoint_moved))
         .route(
             "/api/v1/documents/search/stream",
-            post(search_documents_stream),
+            any(search_endpoint_moved),
         )
+        .route("/v1/documents/search", any(search_endpoint_moved))
+        .route("/v1/documents/search/stream", any(search_endpoint_moved))
+        .route("/v1/search", any(search_endpoint_moved))
         .route(
             "/api/v1/documents/by-hash/{sha256}",
             head(document_by_hash).get(document_by_hash),
@@ -2156,6 +2151,9 @@ pub struct SearchQueryParams {
     pub query: Option<String>,
     pub limit: Option<usize>,
     pub threshold: Option<f32>,
+    /// `Some(true)` forces SSE, `Some(false)` forces JSON, absent negotiates on
+    /// the `Accept` header.
+    pub stream: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2173,6 +2171,10 @@ struct SearchRequest {
     /// because vector similarity and reranker logits are different scales.
     #[serde(default)]
     threshold: Option<f32>,
+    /// `Some(true)` forces SSE, `Some(false)` forces JSON, absent negotiates on
+    /// the `Accept` header.
+    #[serde(default)]
+    stream: Option<bool>,
 }
 
 fn default_search_limit() -> i64 {
@@ -2235,7 +2237,7 @@ impl SearchRequest {
 }
 
 /// One ranked passage with document provenance.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct SearchHit {
     /// Identifier of the `km.document_vector` row.
     chunk_id: Uuid,
@@ -2257,7 +2259,7 @@ struct SearchHit {
     score: f32,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct SearchResponse {
     query: String,
     count: usize,
@@ -2371,13 +2373,17 @@ async fn request_rerank(
     }
 }
 
-async fn execute_search(
-    state: AppState,
-    headers: HeaderMap,
-    payload: SearchRequest,
-) -> Result<axum::Json<SearchResponse>, (StatusCode, String)> {
+/// Shared retrieval pipeline behind both knowledge search renderers.
+///
+/// Runs authentication, query embedding, vector retrieval, reranking, and
+/// ranking exactly once. The caller decides how to render the outcome.
+async fn retrieve_search(
+    state: &AppState,
+    headers: &HeaderMap,
+    payload: &SearchRequest,
+) -> Result<SearchOutcome, (StatusCode, String)> {
     if let Some(oidc) = state.oidc.as_ref() {
-        let Some(token) = bearer_token(&headers) else {
+        let Some(token) = bearer_token(headers) else {
             return Err((
                 StatusCode::UNAUTHORIZED,
                 "missing authorization bearer token".into(),
@@ -2427,33 +2433,213 @@ async fn execute_search(
     let reranked = request_rerank(state.reranker.as_ref(), search.query, &candidates).await;
     let threshold = search.threshold.or(state.search_threshold);
     let results = rank_search_hits(candidates, reranked.as_deref(), search.limit, threshold);
-    Ok(axum::Json(SearchResponse {
+    Ok(SearchOutcome {
         query: search.query.to_string(),
         count: results.len(),
         reranked: reranked.is_some(),
         results,
-    }))
+    })
 }
 
-async fn search_documents(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    axum::Json(payload): axum::Json<SearchRequest>,
-) -> Result<axum::Json<SearchResponse>, (StatusCode, String)> {
-    execute_search(state, headers, payload).await
+/// Retrieved passages plus the facts both renderers report.
+struct SearchOutcome {
+    query: String,
+    count: usize,
+    reranked: bool,
+    results: Vec<SearchHit>,
 }
 
-async fn search_documents_stream(
+/// Resolve the requested transport: explicit flag first, then `Accept`.
+fn resolve_stream(requested: Option<bool>, headers: &HeaderMap) -> bool {
+    requested.unwrap_or_else(|| {
+        headers
+            .get(header::ACCEPT)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.to_ascii_lowercase().contains("text/event-stream"))
+    })
+}
+
+fn render_json(outcome: SearchOutcome) -> Response {
+    axum::Json(SearchResponse {
+        query: outcome.query,
+        count: outcome.count,
+        reranked: outcome.reranked,
+        results: outcome.results,
+    })
+    .into_response()
+}
+
+fn render_sse(state: AppState, outcome: SearchOutcome) -> Response {
+    let SearchOutcome {
+        query,
+        count,
+        reranked,
+        results,
+    } = outcome;
+
+    // Read the pieces the stream needs before the generator takes ownership.
+    let gateway_client = state.gateway.clone();
+    let answer_model = state.answer_model.clone();
+
+    let stream = async_stream::stream! {
+        // 1. Emit metadata event
+        let metadata = SseMetadata {
+            query: &query,
+            count,
+            reranked,
+        };
+        if let Ok(json) = serde_json::to_string(&metadata) {
+            yield Ok::<SseEvent, std::convert::Infallible>(
+                SseEvent::default().event("metadata").data(json)
+            );
+        }
+
+        // 2. Generate answer if gateway is available and there are results
+        if count == 0 {
+            let empty_delta = SseAnswerDelta {
+                delta: "No relevant documents found in knowledge base.".into(),
+            };
+            if let Ok(json) = serde_json::to_string(&empty_delta) {
+                yield Ok(SseEvent::default().event("answer_delta").data(json));
+            }
+        } else if let Some(gw) = gateway_client {
+            let chat_req = build_grounded_chat_request(&answer_model, &query, &results);
+            match gw.chat_completion_stream(chat_req).await {
+                Ok(mut llm_stream) => {
+                    use futures_util::StreamExt;
+                    let mut streamed_any = false;
+                    while let Some(chunk_res) = llm_stream.next().await {
+                        match chunk_res {
+                            Ok(chunk) => {
+                                for choice in chunk.choices {
+                                    if let Some(content) = choice.delta.content {
+                                        if !content.is_empty() {
+                                            streamed_any = true;
+                                            let delta = SseAnswerDelta { delta: content };
+                                            if let Ok(json) = serde_json::to_string(&delta) {
+                                                yield Ok(SseEvent::default().event("answer_delta").data(json));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "error in LLM stream chunk");
+                                let err_evt = SseError {
+                                    error: format!("Error during answer generation: {e}"),
+                                };
+                                if let Ok(json) = serde_json::to_string(&err_evt) {
+                                    yield Ok(SseEvent::default().event("error").data(json));
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    if !streamed_any {
+                        let fallback_delta = SseAnswerDelta {
+                            delta: "Answer could not be generated from retrieved passages.".into(),
+                        };
+                        if let Ok(json) = serde_json::to_string(&fallback_delta) {
+                            yield Ok(SseEvent::default().event("answer_delta").data(json));
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "failed to start LLM completion stream; emitting fallback message");
+                    let fallback_delta = SseAnswerDelta {
+                        delta: "Knowledge Assistant answer generation is currently unavailable. See citations below for retrieved passages.".into(),
+                    };
+                    if let Ok(json) = serde_json::to_string(&fallback_delta) {
+                        yield Ok(SseEvent::default().event("answer_delta").data(json));
+                    }
+                }
+            }
+        } else {
+            let fallback_delta = SseAnswerDelta {
+                delta: "LLM gateway is not configured on this instance. See citations below for retrieved passages.".into(),
+            };
+            if let Ok(json) = serde_json::to_string(&fallback_delta) {
+                yield Ok(SseEvent::default().event("answer_delta").data(json));
+            }
+        }
+
+        // 3. Emit citations event
+        let citations = SseCitations { results };
+        if let Ok(json) = serde_json::to_string(&citations) {
+            yield Ok(SseEvent::default().event("citations").data(json));
+        }
+
+        // 4. Emit done event
+        let done = SseDone { status: "completed" };
+        if let Ok(json) = serde_json::to_string(&done) {
+            yield Ok(SseEvent::default().event("done").data(json));
+        }
+    };
+
+    Sse::new(stream)
+        .keep_alive(axum::response::sse::KeepAlive::default())
+        .into_response()
+}
+
+async fn knowledge_search(
     State(state): State<AppState>,
     headers: HeaderMap,
     axum::Json(payload): axum::Json<SearchRequest>,
 ) -> Result<Response, (StatusCode, String)> {
-    execute_search_stream(state, headers, payload).await
+    let stream = resolve_stream(payload.stream, &headers);
+    let outcome = retrieve_search(&state, &headers, &payload).await?;
+    Ok(if stream {
+        render_sse(state, outcome)
+    } else {
+        render_json(outcome)
+    })
+}
+
+async fn knowledge_search_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<SearchQueryParams>,
+) -> Result<Response, (StatusCode, String)> {
+    let query_str = params.q.or(params.query).unwrap_or_default();
+    let trimmed = query_str.trim();
+    if trimmed.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "query parameter 'q' or 'query' is required".into(),
+        ));
+    }
+    let request = SearchRequest {
+        query: trimmed.to_string(),
+        limit: params
+            .limit
+            .map(|l| l as i64)
+            .unwrap_or_else(default_search_limit),
+        threshold: params.threshold,
+        stream: params.stream,
+    };
+    let stream = resolve_stream(request.stream, &headers);
+    let outcome = retrieve_search(&state, &headers, &request).await?;
+    Ok(if stream {
+        render_sse(state, outcome)
+    } else {
+        render_json(outcome)
+    })
+}
+
+/// Retired search paths answer `410 Gone` instead of falling through to the
+/// SPA handler, which would otherwise return `index.html` with `200`.
+async fn search_endpoint_moved() -> (StatusCode, axum::Json<serde_json::Value>) {
+    (
+        StatusCode::GONE,
+        axum::Json(serde_json::json!({
+            "error": "This search endpoint was removed. Use /api/v1/knowledge/search; pass stream: true or Accept: text/event-stream for SSE."
+        })),
+    )
 }
 
 #[derive(Serialize)]
-struct SseMetadata {
-    query: String,
+struct SseMetadata<'a> {
+    query: &'a str,
     count: usize,
     reranked: bool,
 }
@@ -2534,190 +2720,6 @@ Answer clearly and concisely. For each claim supported by a passage, cite it wit
         session_id: None,
         user_agent: None,
     }
-}
-
-async fn execute_search_stream(
-    state: AppState,
-    headers: HeaderMap,
-    payload: SearchRequest,
-) -> Result<Response, (StatusCode, String)> {
-    if let Some(oidc) = state.oidc.as_ref() {
-        let Some(token) = bearer_token(&headers) else {
-            return Err((
-                StatusCode::UNAUTHORIZED,
-                "missing authorization bearer token".into(),
-            ));
-        };
-        if !oidc.authenticate(token).await {
-            return Err((StatusCode::UNAUTHORIZED, "invalid or expired token".into()));
-        }
-    }
-
-    let search = payload
-        .validate()
-        .map_err(|err| (StatusCode::BAD_REQUEST, err.message()))?;
-
-    let query_embedding = match state.embedder.embed(search.query).await {
-        Ok(embedding) => embedding,
-        Err(err) => {
-            tracing::error!(error = %err, "generating query embedding");
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "failed to embed the search query".into(),
-            ));
-        }
-    };
-
-    let candidate_limit = state.reranker.as_ref().map_or(search.limit, |client| {
-        client.max_candidates().max(search.limit)
-    });
-    let candidates = match state
-        .search_candidates
-        .search_vectors(&query_embedding, candidate_limit as i64)
-        .await
-    {
-        Ok(candidates) => candidates,
-        Err(err) => {
-            tracing::error!(error = %err, "querying document vectors");
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "document search failed".into(),
-            ));
-        }
-    };
-
-    let reranked = request_rerank(state.reranker.as_ref(), search.query, &candidates).await;
-    let threshold = search.threshold.or(state.search_threshold);
-    let results = rank_search_hits(candidates, reranked.as_deref(), search.limit, threshold);
-
-    let query_owned = search.query.to_string();
-    let is_reranked = reranked.is_some();
-    let count = results.len();
-    let gateway_client = state.gateway.clone();
-
-    let stream = async_stream::stream! {
-        // 1. Emit metadata event
-        let metadata = SseMetadata {
-            query: query_owned.clone(),
-            count,
-            reranked: is_reranked,
-        };
-        if let Ok(json) = serde_json::to_string(&metadata) {
-            yield Ok::<SseEvent, std::convert::Infallible>(
-                SseEvent::default().event("metadata").data(json)
-            );
-        }
-
-        // 2. Generate answer if gateway is available and there are results
-        if count == 0 {
-            let empty_delta = SseAnswerDelta {
-                delta: "No relevant documents found in knowledge base.".into(),
-            };
-            if let Ok(json) = serde_json::to_string(&empty_delta) {
-                yield Ok(SseEvent::default().event("answer_delta").data(json));
-            }
-        } else if let Some(gw) = gateway_client {
-            let chat_req =
-                build_grounded_chat_request(&state.answer_model, &query_owned, &results);
-            match gw.chat_completion_stream(chat_req).await {
-                Ok(mut llm_stream) => {
-                    use futures_util::StreamExt;
-                    let mut streamed_any = false;
-                    while let Some(chunk_res) = llm_stream.next().await {
-                        match chunk_res {
-                            Ok(chunk) => {
-                                for choice in chunk.choices {
-                                    if let Some(content) = choice.delta.content {
-                                        if !content.is_empty() {
-                                            streamed_any = true;
-                                            let delta = SseAnswerDelta { delta: content };
-                                            if let Ok(json) = serde_json::to_string(&delta) {
-                                                yield Ok(SseEvent::default().event("answer_delta").data(json));
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "error in LLM stream chunk");
-                                let err_evt = SseError {
-                                    error: format!("Error during answer generation: {e}"),
-                                };
-                                if let Ok(json) = serde_json::to_string(&err_evt) {
-                                    yield Ok(SseEvent::default().event("error").data(json));
-                                }
-                                break;
-                            }
-                        }
-                    }
-                    if !streamed_any {
-                        let fallback_delta = SseAnswerDelta {
-                            delta: "Answer could not be generated from retrieved passages.".into(),
-                        };
-                        if let Ok(json) = serde_json::to_string(&fallback_delta) {
-                            yield Ok(SseEvent::default().event("answer_delta").data(json));
-                        }
-                    }
-                }
-                Err(err) => {
-                    tracing::warn!(error = %err, "failed to start LLM completion stream; emitting fallback message");
-                    let fallback_delta = SseAnswerDelta {
-                        delta: "Knowledge Assistant answer generation is currently unavailable. See citations below for retrieved passages.".into(),
-                    };
-                    if let Ok(json) = serde_json::to_string(&fallback_delta) {
-                        yield Ok(SseEvent::default().event("answer_delta").data(json));
-                    }
-                }
-            }
-        } else {
-            let fallback_delta = SseAnswerDelta {
-                delta: "LLM gateway is not configured on this instance. See citations below for retrieved passages.".into(),
-            };
-            if let Ok(json) = serde_json::to_string(&fallback_delta) {
-                yield Ok(SseEvent::default().event("answer_delta").data(json));
-            }
-        }
-
-        // 3. Emit citations event
-        let citations = SseCitations { results };
-        if let Ok(json) = serde_json::to_string(&citations) {
-            yield Ok(SseEvent::default().event("citations").data(json));
-        }
-
-        // 4. Emit done event
-        let done = SseDone { status: "completed" };
-        if let Ok(json) = serde_json::to_string(&done) {
-            yield Ok(SseEvent::default().event("done").data(json));
-        }
-    };
-
-    Ok(Sse::new(stream)
-        .keep_alive(axum::response::sse::KeepAlive::default())
-        .into_response())
-}
-
-async fn search_documents_get(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(params): Query<SearchQueryParams>,
-) -> Result<axum::Json<SearchResponse>, (StatusCode, String)> {
-    let query_str = params.q.or(params.query).unwrap_or_default();
-    let trimmed = query_str.trim();
-    if trimmed.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "query parameter 'q' or 'query' is required".into(),
-        ));
-    }
-    let request = SearchRequest {
-        query: trimmed.to_string(),
-        limit: params
-            .limit
-            .map(|l| l as i64)
-            .unwrap_or_else(default_search_limit),
-        threshold: params.threshold,
-    };
-    execute_search(state, headers, request).await
 }
 
 async fn run_watcher(
@@ -3045,7 +3047,7 @@ mod tests {
     #[test]
     fn server_answer_model_defaults_and_parses_from_config() {
         let default_config: ServerConfig = toml::from_str("").unwrap();
-        assert_eq!(default_config.answer_model, "agy/gemini-3.8-flash-low");
+        assert_eq!(default_config.answer_model, "opencode/big-pickle");
 
         let configured: ServerConfig = toml::from_str(
             r#"
@@ -3084,7 +3086,7 @@ mod tests {
 
         let configured: ServerConfig = toml::from_str("search_threshold = 0.0").unwrap();
         assert_eq!(configured.search_threshold, Some(0.0));
-        assert_eq!(configured.answer_model, "agy/gemini-3.8-flash-low");
+        assert_eq!(configured.answer_model, "opencode/big-pickle");
 
         // The reranker emits unbounded logits, so a negative value is valid.
         let negative: ServerConfig = toml::from_str("search_threshold = -11.5").unwrap();
@@ -3132,8 +3134,9 @@ mod tests {
         let request = build_grounded_chat_request("opencode/test-model", "question", &results);
 
         assert_eq!(request.model, "opencode/test-model");
-        let default_request = build_grounded_chat_request(&default_answer_model(), "question", &results);
-        assert_eq!(default_request.model, "agy/gemini-3.8-flash-low");
+        let default_request =
+            build_grounded_chat_request(&default_answer_model(), "question", &results);
+        assert_eq!(default_request.model, "opencode/big-pickle");
         let system_prompt = request.messages[0]
             .content
             .as_ref()
@@ -3555,6 +3558,7 @@ mod tests {
             query: "  \n\t ".into(),
             limit: 5,
             threshold: None,
+            stream: None,
         };
         assert_eq!(
             blank.validate().unwrap_err(),
@@ -3565,6 +3569,7 @@ mod tests {
             query: "a".repeat(MAX_SEARCH_QUERY_CHARS + 1),
             limit: 5,
             threshold: None,
+            stream: None,
         };
         assert_eq!(
             overlong.validate().unwrap_err(),
@@ -3579,6 +3584,7 @@ mod tests {
                 query: "schema drift".into(),
                 limit,
                 threshold: None,
+                stream: None,
             };
             assert_eq!(
                 request.validate().unwrap_err(),
@@ -3590,6 +3596,7 @@ mod tests {
                 query: "schema drift".into(),
                 limit,
                 threshold: None,
+                stream: None,
             };
             assert_eq!(request.validate().unwrap().limit, limit as usize);
         }
@@ -3602,6 +3609,7 @@ mod tests {
                 query: "schema drift".into(),
                 limit: 5,
                 threshold: Some(threshold),
+                stream: None,
             };
             assert_eq!(
                 request.validate().unwrap_err(),
@@ -3614,6 +3622,7 @@ mod tests {
                 query: "schema drift".into(),
                 limit: 5,
                 threshold: Some(threshold),
+                stream: None,
             };
             assert_eq!(request.validate().unwrap().threshold, Some(threshold));
         }
@@ -3625,6 +3634,7 @@ mod tests {
             serde_json::from_value(serde_json::json!({"query": "  schema drift  "})).unwrap();
         assert_eq!(request.limit, 5);
         assert_eq!(request.threshold, None);
+        assert_eq!(request.stream, None);
         let validated = request.validate().unwrap();
         assert_eq!(validated.query, "schema drift");
         assert_eq!(validated.limit, 5);
@@ -3641,6 +3651,29 @@ mod tests {
             outcome.unwrap_err(),
             SearchValidationError::NonFiniteThreshold
         );
+    }
+
+    #[test]
+    fn resolve_stream_prefers_explicit_flag_and_falls_back_to_accept() {
+        let mut sse_headers = HeaderMap::new();
+        sse_headers.insert(header::ACCEPT, "text/event-stream".parse().unwrap());
+        let mut json_headers = HeaderMap::new();
+        json_headers.insert(header::ACCEPT, "application/json".parse().unwrap());
+        let mut mixed_case_headers = HeaderMap::new();
+        mixed_case_headers.insert(
+            header::ACCEPT,
+            "application/json, Text/Event-Stream".parse().unwrap(),
+        );
+
+        // Explicit values always win, whatever the client advertises.
+        assert!(resolve_stream(Some(true), &json_headers));
+        assert!(!resolve_stream(Some(false), &sse_headers));
+
+        // Absent, the Accept header negotiates, case-insensitively.
+        assert!(!resolve_stream(None, &HeaderMap::new()));
+        assert!(resolve_stream(None, &sse_headers));
+        assert!(!resolve_stream(None, &json_headers));
+        assert!(resolve_stream(None, &mixed_case_headers));
     }
 
     #[test]
@@ -4212,6 +4245,14 @@ mod tests {
         assert_eq!(hits[0].vector_score, 0.91);
     }
 
+    /// Deserialize a JSON handler response body.
+    async fn json_body<T: serde::de::DeserializeOwned>(response: Response) -> T {
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).expect("handler returned JSON")
+    }
+
     #[tokio::test]
     async fn search_endpoint_requires_valid_bearer_token() {
         let state = search_test_state(Some(inert_oidc_validator()));
@@ -4220,24 +4261,25 @@ mod tests {
                 query: "schema drift".into(),
                 limit: 5,
                 threshold: None,
+                stream: None,
             })
         };
 
-        let missing = search_documents(State(state.clone()), HeaderMap::new(), request())
+        let missing = knowledge_search(State(state.clone()), HeaderMap::new(), request())
             .await
             .unwrap_err();
         assert_eq!(missing.0, StatusCode::UNAUTHORIZED);
 
         let mut headers = HeaderMap::new();
         headers.insert(header::AUTHORIZATION, "Basic abc".parse().unwrap());
-        let wrong_scheme = search_documents(State(state.clone()), headers, request())
+        let wrong_scheme = knowledge_search(State(state.clone()), headers, request())
             .await
             .unwrap_err();
         assert_eq!(wrong_scheme.0, StatusCode::UNAUTHORIZED);
 
         let mut headers = HeaderMap::new();
         headers.insert(header::AUTHORIZATION, "Bearer garbage".parse().unwrap());
-        let invalid = search_documents(State(state), headers, request())
+        let invalid = knowledge_search(State(state), headers, request())
             .await
             .unwrap_err();
         assert_eq!(invalid.0, StatusCode::UNAUTHORIZED);
@@ -4251,24 +4293,25 @@ mod tests {
                 query: "schema drift".into(),
                 limit: 5,
                 threshold: None,
+                stream: Some(true),
             })
         };
 
-        let missing = search_documents_stream(State(state.clone()), HeaderMap::new(), request())
+        let missing = knowledge_search(State(state.clone()), HeaderMap::new(), request())
             .await
             .unwrap_err();
         assert_eq!(missing.0, StatusCode::UNAUTHORIZED);
 
         let mut headers = HeaderMap::new();
         headers.insert(header::AUTHORIZATION, "Basic abc".parse().unwrap());
-        let wrong_scheme = search_documents_stream(State(state.clone()), headers, request())
+        let wrong_scheme = knowledge_search(State(state.clone()), headers, request())
             .await
             .unwrap_err();
         assert_eq!(wrong_scheme.0, StatusCode::UNAUTHORIZED);
 
         let mut headers = HeaderMap::new();
         headers.insert(header::AUTHORIZATION, "Bearer garbage".parse().unwrap());
-        let invalid = search_documents_stream(State(state), headers, request())
+        let invalid = knowledge_search(State(state), headers, request())
             .await
             .unwrap_err();
         assert_eq!(invalid.0, StatusCode::UNAUTHORIZED);
@@ -4285,24 +4328,28 @@ mod tests {
                 query: "   ".into(),
                 limit: 5,
                 threshold: None,
+                stream: None,
             },
             SearchRequest {
                 query: "schema drift".into(),
                 limit: 0,
                 threshold: None,
+                stream: None,
             },
             SearchRequest {
                 query: "schema drift".into(),
                 limit: MAX_SEARCH_LIMIT + 1,
                 threshold: None,
+                stream: None,
             },
             SearchRequest {
                 query: "schema drift".into(),
                 limit: 5,
                 threshold: Some(f32::INFINITY),
+                stream: None,
             },
         ] {
-            let response = search_documents(
+            let response = knowledge_search(
                 State(state.clone()),
                 HeaderMap::new(),
                 axum::Json(request.clone()),
@@ -4311,10 +4358,13 @@ mod tests {
             .unwrap_err();
             assert_eq!(response.0, StatusCode::BAD_REQUEST);
 
-            let stream_response = search_documents_stream(
+            let stream_response = knowledge_search(
                 State(state.clone()),
                 HeaderMap::new(),
-                axum::Json(request),
+                axum::Json(SearchRequest {
+                    stream: Some(true),
+                    ..request
+                }),
             )
             .await
             .unwrap_err();
@@ -4332,8 +4382,9 @@ mod tests {
             query: None,
             limit: None,
             threshold: None,
+            stream: None,
         };
-        let res = search_documents_get(State(state.clone()), HeaderMap::new(), Query(empty_params))
+        let res = knowledge_search_get(State(state.clone()), HeaderMap::new(), Query(empty_params))
             .await
             .unwrap_err();
         assert_eq!(res.0, StatusCode::BAD_REQUEST);
@@ -4345,8 +4396,9 @@ mod tests {
             query: None,
             limit: None,
             threshold: None,
+            stream: None,
         };
-        let res = search_documents_get(State(state.clone()), HeaderMap::new(), Query(blank_params))
+        let res = knowledge_search_get(State(state.clone()), HeaderMap::new(), Query(blank_params))
             .await
             .unwrap_err();
         assert_eq!(res.0, StatusCode::BAD_REQUEST);
@@ -4358,9 +4410,10 @@ mod tests {
             query: None,
             limit: Some((MAX_SEARCH_LIMIT + 1) as usize),
             threshold: None,
+            stream: None,
         };
         let res =
-            search_documents_get(State(state.clone()), HeaderMap::new(), Query(invalid_limit))
+            knowledge_search_get(State(state.clone()), HeaderMap::new(), Query(invalid_limit))
                 .await
                 .unwrap_err();
         assert_eq!(res.0, StatusCode::BAD_REQUEST);
@@ -4371,8 +4424,9 @@ mod tests {
             query: Some("test".into()),
             limit: Some(5),
             threshold: Some(f32::NAN),
+            stream: None,
         };
-        let res = search_documents_get(State(state), HeaderMap::new(), Query(invalid_threshold))
+        let res = knowledge_search_get(State(state), HeaderMap::new(), Query(invalid_threshold))
             .await
             .unwrap_err();
         assert_eq!(res.0, StatusCode::BAD_REQUEST);
@@ -4411,13 +4465,16 @@ mod tests {
                 query: THRESHOLD_QUERY.into(),
                 limit: 5,
                 threshold,
+                stream: None,
             })
         };
 
-        let configured = search_documents(State(state.clone()), HeaderMap::new(), request(None))
-            .await
-            .unwrap()
-            .0;
+        let configured: SearchResponse = json_body(
+            knowledge_search(State(state.clone()), HeaderMap::new(), request(None))
+                .await
+                .unwrap(),
+        )
+        .await;
         assert!(configured.reranked);
         assert_eq!(configured.count, 1);
         assert_eq!(configured.results[0].document_code, "meaning-of-life");
@@ -4426,25 +4483,29 @@ mod tests {
             Some(reranker::logit_to_percentage(1.47))
         );
 
-        let widened = search_documents(
-            State(state.clone()),
-            HeaderMap::new(),
-            request(Some(reranker::logit_to_percentage(-5.0))),
+        let widened: SearchResponse = json_body(
+            knowledge_search(
+                State(state.clone()),
+                HeaderMap::new(),
+                request(Some(reranker::logit_to_percentage(-5.0))),
+            )
+            .await
+            .unwrap(),
         )
-        .await
-        .unwrap()
-        .0;
+        .await;
         assert!(widened.reranked);
         assert_eq!(widened.count, 2);
 
-        let narrowed = search_documents(
-            State(state),
-            HeaderMap::new(),
-            request(Some(reranker::logit_to_percentage(5.0))),
+        let narrowed: SearchResponse = json_body(
+            knowledge_search(
+                State(state),
+                HeaderMap::new(),
+                request(Some(reranker::logit_to_percentage(5.0))),
+            )
+            .await
+            .unwrap(),
         )
-        .await
-        .unwrap()
-        .0;
+        .await;
         assert!(narrowed.reranked);
         assert_eq!(narrowed.count, 0);
         assert!(narrowed.results.is_empty());
@@ -4459,35 +4520,42 @@ mod tests {
                 query: None,
                 limit: Some(5),
                 threshold,
+                stream: None,
             })
         };
 
-        let configured = search_documents_get(State(state.clone()), HeaderMap::new(), params(None))
-            .await
-            .unwrap()
-            .0;
+        let configured: SearchResponse = json_body(
+            knowledge_search_get(State(state.clone()), HeaderMap::new(), params(None))
+                .await
+                .unwrap(),
+        )
+        .await;
         assert!(configured.reranked);
         assert_eq!(configured.count, 1);
         assert_eq!(configured.results[0].document_code, "meaning-of-life");
 
-        let widened = search_documents_get(
-            State(state.clone()),
-            HeaderMap::new(),
-            params(Some(reranker::logit_to_percentage(-5.0))),
+        let widened: SearchResponse = json_body(
+            knowledge_search_get(
+                State(state.clone()),
+                HeaderMap::new(),
+                params(Some(reranker::logit_to_percentage(-5.0))),
+            )
+            .await
+            .unwrap(),
         )
-        .await
-        .unwrap()
-        .0;
+        .await;
         assert_eq!(widened.count, 2);
 
-        let narrowed = search_documents_get(
-            State(state),
-            HeaderMap::new(),
-            params(Some(reranker::logit_to_percentage(5.0))),
+        let narrowed: SearchResponse = json_body(
+            knowledge_search_get(
+                State(state),
+                HeaderMap::new(),
+                params(Some(reranker::logit_to_percentage(5.0))),
+            )
+            .await
+            .unwrap(),
         )
-        .await
-        .unwrap()
-        .0;
+        .await;
         assert!(narrowed.reranked);
         assert_eq!(narrowed.count, 0);
     }
@@ -4518,13 +4586,16 @@ mod tests {
                 query: "anything".into(),
                 limit: 5,
                 threshold: Some(95.0),
+                stream: None,
             })
         };
 
-        let response = search_documents(State(state.clone()), HeaderMap::new(), request())
-            .await
-            .unwrap()
-            .0;
+        let response: SearchResponse = json_body(
+            knowledge_search(State(state.clone()), HeaderMap::new(), request())
+                .await
+                .unwrap(),
+        )
+        .await;
         assert!(!response.reranked);
         assert_eq!(response.count, 3);
         assert_eq!(
@@ -4544,9 +4615,16 @@ mod tests {
         assert_eq!(response.results[0].score, 91.0);
         assert_eq!(response.results[0].vector_score, 0.91);
 
-        let stream = search_documents_stream(State(state), HeaderMap::new(), request())
-            .await
-            .unwrap();
+        let stream = knowledge_search(
+            State(state),
+            HeaderMap::new(),
+            axum::Json(SearchRequest {
+                stream: Some(true),
+                ..request().0
+            }),
+        )
+        .await
+        .unwrap();
         let body = axum::body::to_bytes(stream.into_body(), 1024 * 1024)
             .await
             .unwrap();
@@ -4573,13 +4651,14 @@ mod tests {
             Some(50.0),
         );
 
-        let stream = search_documents_stream(
+        let stream = knowledge_search(
             State(state),
             HeaderMap::new(),
             axum::Json(SearchRequest {
                 query: "what is the capital of France".into(),
                 limit: 5,
                 threshold: None,
+                stream: Some(true),
             }),
         )
         .await
@@ -4614,13 +4693,14 @@ mod tests {
     async fn stream_citations_match_metadata_count_with_mixed_scores() {
         let state = search_threshold_state(Some(50.0)).await;
 
-        let stream = search_documents_stream(
+        let stream = knowledge_search(
             State(state),
             HeaderMap::new(),
             axum::Json(SearchRequest {
                 query: THRESHOLD_QUERY.into(),
                 limit: 5,
                 threshold: None,
+                stream: Some(true),
             }),
         )
         .await
@@ -4652,22 +4732,17 @@ mod tests {
             .route("/api/v1/health", get(|| async { "ok" }))
             .route("/health", get(|| async { "ok" }))
             .route(
-                "/v1/documents/search",
-                get(search_documents_get).post(search_documents),
+                "/api/v1/knowledge/search",
+                get(knowledge_search_get).post(knowledge_search),
             )
-            .route("/v1/documents/search/stream", post(search_documents_stream))
-            .route(
-                "/v1/search",
-                get(search_documents_get).post(search_documents),
-            )
-            .route(
-                "/api/v1/documents/search",
-                get(search_documents_get).post(search_documents),
-            )
+            .route("/api/v1/documents/search", any(search_endpoint_moved))
             .route(
                 "/api/v1/documents/search/stream",
-                post(search_documents_stream),
+                any(search_endpoint_moved),
             )
+            .route("/v1/documents/search", any(search_endpoint_moved))
+            .route("/v1/documents/search/stream", any(search_endpoint_moved))
+            .route("/v1/search", any(search_endpoint_moved))
             .with_state(state);
 
         for path in ["/v1/health", "/api/v1/health", "/health"] {
@@ -4682,50 +4757,71 @@ mod tests {
             assert_eq!(&body[..], b"ok");
         }
 
-        for path in [
-            "/v1/documents/search?q=test",
-            "/v1/search?query=test",
-            "/api/v1/documents/search?q=test",
+        // The single knowledge endpoint matches on both methods. Dependencies are
+        // unreachable in this state, so reaching the retrieval failure is the
+        // proof that the route matched and validation ran.
+        for (method, body) in [
+            ("GET", None),
+            ("POST", Some(r#"{"query":"test"}"#)),
+            ("POST", Some(r#"{"query":"test","stream":true}"#)),
         ] {
-            let req = axum::http::Request::builder()
-                .uri(path)
-                .method("GET")
-                .body(axum::body::Body::empty())
-                .unwrap();
+            let builder = axum::http::Request::builder()
+                .uri("/api/v1/knowledge/search?q=test")
+                .method(method);
+            let req = match body {
+                Some(payload) => builder
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(payload))
+                    .unwrap(),
+                None => builder.body(axum::body::Body::empty()).unwrap(),
+            };
             let resp = app.clone().oneshot(req).await.unwrap();
-            // Since dependencies (embedder/db) are unreachable in test_state, reaching internal server error
-            // confirms the route matched, query was extracted/validated, and execution proceeded.
-            assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            assert!(
+                resp.status().is_success() || resp.status() == StatusCode::INTERNAL_SERVER_ERROR,
+                "unexpected status {} for {method} knowledge search",
+                resp.status()
+            );
         }
 
+        // The five retired paths answer 410 on every method, so neither the SPA
+        // fallback nor a stale handler can swallow them.
         for path in [
-            "/v1/documents/search",
-            "/v1/search",
             "/api/v1/documents/search",
-        ] {
-            let req = axum::http::Request::builder()
-                .uri(path)
-                .method("POST")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(axum::body::Body::from(r#"{"query":"test"}"#))
-                .unwrap();
-            let resp = app.clone().oneshot(req).await.unwrap();
-            assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        }
-
-        for path in [
-            "/v1/documents/search/stream",
             "/api/v1/documents/search/stream",
+            "/v1/documents/search",
+            "/v1/documents/search/stream",
+            "/v1/search",
         ] {
-            let req = axum::http::Request::builder()
-                .uri(path)
-                .method("POST")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(axum::body::Body::from(r#"{"query":"test"}"#))
-                .unwrap();
-            let resp = app.clone().oneshot(req).await.unwrap();
-            // In test_state, embedder fails with INTERNAL_SERVER_ERROR
-            assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            for method in ["GET", "POST", "PUT", "DELETE", "HEAD"] {
+                let req = axum::http::Request::builder()
+                    .uri(format!("{path}?q=test"))
+                    .method(method)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(r#"{"query":"test"}"#))
+                    .unwrap();
+                let resp = app.clone().oneshot(req).await.unwrap();
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::GONE,
+                    "expected 410 for {method} {path}"
+                );
+                if method == "HEAD" {
+                    continue;
+                }
+                let body = axum::body::to_bytes(resp.into_body(), 1024 * 64)
+                    .await
+                    .unwrap();
+                let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                let error = payload["error"].as_str().unwrap_or_default();
+                assert!(
+                    error.contains("/api/v1/knowledge/search"),
+                    "tombstone error must name the new endpoint: {error}"
+                );
+                assert!(
+                    error.contains("stream: true") || error.contains("text/event-stream"),
+                    "tombstone error must document SSE selection: {error}"
+                );
+            }
         }
     }
 
