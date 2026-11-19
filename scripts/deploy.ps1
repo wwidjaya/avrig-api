@@ -160,6 +160,36 @@ if ($Target -in @('all', 'windows')) {
 
     # If legacy or current NSSM service exists, stop it before replacing the binary
     $isAdmin = ([Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+    # Record the node service state before anything stops it, so the restart
+    # later in this block is driven by what this run did and not by the service
+    # merely existing. A service that was already stopped stays stopped.
+    $nodeService = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+    $serviceWasStopped = ($null -ne $nodeService) -and ($nodeService.Status -ne 'Stopped')
+
+    # Stop the node service ourselves rather than relying on nssm, so the wait
+    # below is bounded and the restart is driven by what this run did. The
+    # service holds a handle on the executable while it runs, so the replace
+    # cannot proceed until it is genuinely Stopped.
+    if ($serviceWasStopped) {
+        Write-Host "Stopping Windows service '$serviceName' before replacing the binary..." -ForegroundColor Cyan
+        if ($isAdmin) {
+            Stop-Service -Name $serviceName -Force
+        } else {
+            Start-Process powershell.exe -ArgumentList @("-NoProfile", "-Command", "Stop-Service -Name $serviceName -Force") -Verb RunAs -Wait
+        }
+
+        $stopDeadline = (Get-Date).AddSeconds(30)
+        while ($nodeService.Status -ne 'Stopped') {
+            if ((Get-Date) -gt $stopDeadline) {
+                throw "Windows service '$serviceName' did not reach Stopped within 30 seconds (status $($nodeService.Status)). Stop it manually, then retry make deploy."
+            }
+            Start-Sleep -Milliseconds 500
+            $nodeService.Refresh()
+        }
+        Write-Host "Windows service '$serviceName' stopped." -ForegroundColor Cyan
+    }
+
     if ($nssmCmd) {
         foreach ($name in @($serviceName, $legacyServiceName)) {
             $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
@@ -175,29 +205,73 @@ if ($Target -in @('all', 'windows')) {
         }
     }
 
-    $runningCopies = Get-Process avrig -ErrorAction SilentlyContinue |
-        ForEach-Object {
-            Get-CimInstance Win32_Process -Filter "ProcessId = $($_.Id)" -ErrorAction SilentlyContinue
-        } |
-        Where-Object { $_.ExecutablePath -eq $destination }
-
-    if ($runningCopies) {
-        $pids = ($runningCopies | ForEach-Object { $_.ProcessId }) -join ', '
-        throw "Cannot replace $destination while it is running (PID $pids). Stop that avrig process or service, then retry make deploy."
-    }
-
+    # Only a process holding the destination that is not the service reaches
+    # this throw. The service is already stopped above, so an operator-run
+    # avrig.exe is reported rather than killed.
+    #
+    # $serviceWasStopped is set outside this try so the finally can read it. The
+    # finally puts the node back up even when the guard or the replace fails, and
+    # the failure is rethrown afterwards so the original cause is kept.
     New-Item -ItemType Directory -Path $destinationDir -Force | Out-Null
+    $replaceError = $null
     try {
+        $runningCopies = Get-Process avrig -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                Get-CimInstance Win32_Process -Filter "ProcessId = $($_.Id)" -ErrorAction SilentlyContinue
+            } |
+            Where-Object { $_.ExecutablePath -eq $destination }
+
+        if ($runningCopies) {
+            $pids = ($runningCopies | ForEach-Object { $_.ProcessId }) -join ', '
+            throw "Cannot replace $destination while it is running (PID $pids). Stop that avrig process or service, then retry make deploy."
+        }
+
         Copy-Item -Path $source -Destination $staged -Force
         if (Test-Path $destination) {
             Remove-Item $destination -Force
         }
         Move-Item -Path $staged -Destination $destination -Force
     }
+    catch {
+        $replaceError = $_
+    }
     finally {
         if (Test-Path $staged) {
             Remove-Item $staged -Force
         }
+        if ($serviceWasStopped) {
+            Write-Host "Restarting Windows service '$serviceName'..." -ForegroundColor Cyan
+            try {
+                if ($isAdmin) {
+                    Start-Service -Name $serviceName
+                } else {
+                    Start-Process powershell.exe -ArgumentList @("-NoProfile", "-Command", "Start-Service -Name $serviceName") -Verb RunAs -Wait
+                }
+            }
+            catch {
+                # Swallowed on purpose: the poll below reports the real outcome,
+                # and a throw from inside finally would hide $replaceError.
+                Write-Warning "Start-Service on '$serviceName' returned an error: $($_.Exception.Message). Verifying the actual state."
+            }
+            $restartedService = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+            $startDeadline = (Get-Date).AddSeconds(30)
+            while ($restartedService -and $restartedService.Status -ne 'Running') {
+                if ((Get-Date) -gt $startDeadline) {
+                    break
+                }
+                Start-Sleep -Milliseconds 500
+                $restartedService.Refresh()
+            }
+            if (-not $restartedService -or $restartedService.Status -ne 'Running') {
+                $status = if ($restartedService) { $restartedService.Status } else { 'missing' }
+                $detail = if ($replaceError) { " The binary replacement also failed: $($replaceError.Exception.Message)" } else { '' }
+                throw "Windows service '$serviceName' did not reach Running within 30 seconds after the deploy (status $status).$detail"
+            }
+            Write-Host "Windows service '$serviceName' is Running." -ForegroundColor Cyan
+        }
+    }
+    if ($replaceError) {
+        throw $replaceError
     }
 
     $deployed = Get-Item $destination
@@ -243,24 +317,11 @@ if ($Target -in @('all', 'windows')) {
         }
     }
 
-    # Ensure server.toml carries the answer model. The file is created once with
-    # an explicit loopback binding, never copied from the repository template,
-    # which binds 0.0.0.0.
-    $destServerToml = Join-Path $destinationConfigDir 'server.toml'
-    if (-not (Test-Path -LiteralPath $destServerToml)) {
-        $windowsServerToml = @(
-            '[server]'
-            'host = "127.0.0.1"'
-            'port = 8000'
-            'upload_dir = "data/uploads"'
-            "answer_model = `"$serverAnswerModel`""
-            'search_threshold = 0.1'
-            ''
-        ) -join "`n"
-        [System.IO.File]::WriteAllText($destServerToml, $windowsServerToml, (New-Object System.Text.UTF8Encoding($false)))
-        Write-Host "Created Windows server config with loopback binding: $destServerToml" -ForegroundColor Cyan
-    }
-    Set-ServerTomlAnswerModel -Path $destServerToml -Model $serverAnswerModel -Description 'Windows'
+    # No Windows server.toml. This node runs roles = ["watcher", "reranker",
+    # "gateway"], so main.rs takes the unified-node branch and mounts no
+    # knowledge routes. The listener here comes from reranker.toml, not from a
+    # [server] section. answer_model is a Linux-node concern; writing the file
+    # on this node would imply coverage the node does not have.
 }
 
 # Deploy to WSL /opt/avrig
