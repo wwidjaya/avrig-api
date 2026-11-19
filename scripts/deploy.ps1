@@ -12,7 +12,7 @@ $destinationDir = 'D:\avrig'
 # The answer model the Linux node must carry. Patched into that node's own
 # server.toml; the repository template is never copied, because it binds 0.0.0.0.
 # The Windows node has no server role, so it carries no server.toml at all.
-$serverAnswerModel = 'opencode/big-pickle'
+$serverAnswerModel = 'opencode/glm-5'
 
 function Get-Sha256([string]$Path) {
     $algorithm = [System.Security.Cryptography.SHA256]::Create()

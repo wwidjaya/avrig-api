@@ -178,13 +178,20 @@ the stream continues to `citations`.
 ### Answer model
 
 Streaming answers are generated from the retrieved passages by the model named in
-`server.answer_model`, which defaults to `opencode/big-pickle`. The value is a
+`server.answer_model`, which defaults to `opencode/glm-5`. The value is a
 `provider/model` string, so `opencode` selects the gateway's `opencode` provider
-and `big-pickle` is forwarded upstream unchanged. That provider authenticates
+and `glm-5` is forwarded upstream unchanged. That provider authenticates
 with `OPENCODE_API_KEY`, which is separate from the `OPENCODE_CONSOLE_API_KEY`
 used by the console client described above. When the key is missing or the
 provider is not configured, search itself still succeeds and the answer falls
 back as described.
+
+The default is a paid-tier OpenCode model on purpose. `opencode/big-pickle` is
+free but subject to a free-usage quota that returns `429 FreeUsageLimitError`
+once exhausted, which silently degrades every answer to the citations-only
+fallback while search itself keeps working. If a deployment must use a free
+model, expect that failure mode and monitor for `answer_delta` carrying the
+"currently unavailable" fallback text.
 
 Validation errors, including a blank query, a query over 4096 characters, a
 `limit` outside `1..=50`, and a non-finite `threshold`, return `400`. A missing

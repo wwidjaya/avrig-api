@@ -290,7 +290,7 @@ fn default_upload_dir() -> PathBuf {
     PathBuf::from("data/uploads")
 }
 fn default_answer_model() -> String {
-    "opencode/big-pickle".into()
+    "opencode/glm-5".into()
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -3047,7 +3047,7 @@ mod tests {
     #[test]
     fn server_answer_model_defaults_and_parses_from_config() {
         let default_config: ServerConfig = toml::from_str("").unwrap();
-        assert_eq!(default_config.answer_model, "opencode/big-pickle");
+        assert_eq!(default_config.answer_model, "opencode/glm-5");
 
         let configured: ServerConfig = toml::from_str(
             r#"
@@ -3086,7 +3086,7 @@ mod tests {
 
         let configured: ServerConfig = toml::from_str("search_threshold = 0.0").unwrap();
         assert_eq!(configured.search_threshold, Some(0.0));
-        assert_eq!(configured.answer_model, "opencode/big-pickle");
+        assert_eq!(configured.answer_model, "opencode/glm-5");
 
         // The reranker emits unbounded logits, so a negative value is valid.
         let negative: ServerConfig = toml::from_str("search_threshold = -11.5").unwrap();
@@ -3136,7 +3136,7 @@ mod tests {
         assert_eq!(request.model, "opencode/test-model");
         let default_request =
             build_grounded_chat_request(&default_answer_model(), "question", &results);
-        assert_eq!(default_request.model, "opencode/big-pickle");
+        assert_eq!(default_request.model, "opencode/glm-5");
         let system_prompt = request.messages[0]
             .content
             .as_ref()
